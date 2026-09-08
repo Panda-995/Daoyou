@@ -1,0 +1,99 @@
+name: daoyou
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: daoyou
+      POSTGRES_USER: daoyou
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U daoyou -d daoyou"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nats:
+    image: nats:2.11-alpine
+    restart: unless-stopped
+    environment:
+      NATS_PASSWORD: ${NATS_PASSWORD:?Set NATS_PASSWORD in .env}
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        printf 'max_payload: 8MB\n' > /tmp/nats.conf
+        exec nats-server --config=/tmp/nats.conf --jetstream --store_dir=/data/jetstream --http_port=8222 --user=app --pass="$$NATS_PASSWORD"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: [CMD-SHELL, 'wget -qO- http://127.0.0.1:8222/healthz | grep -q ok']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    image: ghcr.io/panda-995/daoyou-app:${IMAGE_TAG:-latest}
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://daoyou:${POSTGRES_PASSWORD}@db:5432/daoyou
+    command: [bun, run, dist/migrate.js]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    image: ghcr.io/panda-995/daoyou-app:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: postgresql://daoyou:${POSTGRES_PASSWORD}@db:5432/daoyou
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      NATS_SERVERS: nats://nats:4222
+      NATS_USER: app
+      NATS_PASSWORD: ${NATS_PASSWORD}
+      BETTER_AUTH_URL: ${SITE_URL:?Set SITE_URL to your site address in .env}
+      PUBLIC_WEB_ORIGINS: ${SITE_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in .env}
+      ALTCHA_HMAC_SECRET: ${ALTCHA_HMAC_SECRET:?Set ALTCHA_HMAC_SECRET in .env}
+      CRON_SECRET: ${CRON_SECRET:?Set CRON_SECRET in .env}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  web:
+    image: ghcr.io/panda-995/daoyou-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:

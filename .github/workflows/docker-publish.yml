@@ -1,0 +1,119 @@
+name: Build and publish multi-architecture images
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'drizzle/**'
+      - 'drizzle-auth/**'
+      - 'docker/**'
+      - 'package.json'
+      - 'bun.lock'
+      - 'bunfig.toml'
+      - 'vite*.ts'
+      - 'tsconfig*.json'
+      - '.dockerignore'
+      - 'compose.yaml'
+      - '.github/workflows/docker-publish.yml'
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build app with TypeScript checks
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.app
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ghcr.io/panda-995/daoyou-app:${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=GPL-3.0
+          cache-from: type=gha,scope=app-${{ matrix.arch }}
+          cache-to: type=gha,scope=app-${{ matrix.arch }},mode=max
+      - name: Build web with TypeScript checks
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.web
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ghcr.io/panda-995/daoyou-web:${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=GPL-3.0
+          cache-from: type=gha,scope=web-${{ matrix.arch }}
+          cache-to: type=gha,scope=web-${{ matrix.arch }},mode=max
+      - name: Verify Compose startup and database migrations
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          umask 077
+          for key in POSTGRES_PASSWORD REDIS_PASSWORD NATS_PASSWORD BETTER_AUTH_SECRET ALTCHA_HMAC_SECRET CRON_SECRET; do
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)" >> .env
+          done
+          printf 'SITE_URL=http://localhost:8081\nWEB_PORT=8081\n' >> .env
+          docker compose up -d --wait --wait-timeout 240
+          curl --fail http://localhost:8081/ > /tmp/home.html
+          grep -q '<html' /tmp/home.html
+          curl --fail http://localhost:8081/login > /dev/null
+          curl --fail http://localhost:8081/api/health-check | tee /tmp/health.json
+          docker compose exec -T db psql -U daoyou -d daoyou -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM drizzle.__drizzle_migrations; SELECT count(*) FROM drizzle.__drizzle_auth_migrations;'
+          docker compose run --rm migrate
+          docker compose exec -T app bun -e "if(!await Bun.file('dist/online-battle-resolver.js').exists())process.exit(1);console.log(process.arch)"
+      - name: Publish tested architecture images
+        run: |
+          docker push ghcr.io/panda-995/daoyou-app:${{ github.sha }}-${{ matrix.arch }}
+          docker push ghcr.io/panda-995/daoyou-web:${{ github.sha }}-${{ matrix.arch }}
+      - name: Diagnostic logs
+        if: failure()
+        run: if [ -f .env ]; then docker compose logs --tail=100; fi
+      - name: Clean up runtime check
+        if: always()
+        run: if [ -f .env ]; then docker compose down -v; fi
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and verify both platforms
+        run: |
+          for component in app web; do
+            image="ghcr.io/panda-995/daoyou-$component"
+            docker buildx imagetools create -t "$image:latest" -t "$image:sha-${GITHUB_SHA::12}" \
+              "$image:$GITHUB_SHA-amd64" "$image:$GITHUB_SHA-arm64"
+            docker buildx imagetools inspect "$image:latest" --raw | tee /tmp/manifest.json
+            jq -e '([.manifests[].platform | select(.os == "linux") | .architecture] | sort) == ["amd64","arm64"]' /tmp/manifest.json
+          done
